@@ -17,8 +17,8 @@ class RegressionDynamics(nn.Module):
         super().__init__()
         self.encoder = GraphEncoder(cfg)
         self.dt_embed = MLP(1, cfg.embed_dim, cfg.embed_dim)
-        # decoder maps node embeddings back to state features (x, y, vx, vy)
-        self.decoder = MLP(cfg.embed_dim, cfg.embed_dim, 4)
+        # decoder maps node embeddings back to state features (pos, vel)
+        self.decoder = MLP(cfg.embed_dim, cfg.embed_dim, 2 * cfg.n_dim)
 
     def forward(self, state_ctx, state_tgt, dt, mass):
         # Encode context
@@ -47,16 +47,17 @@ class HNNDynamics(nn.Module):
     def __init__(self, cfg: ModelCfg):
         super().__init__()
         self.encoder = GraphEncoder(cfg)
+        self.n_dim = cfg.n_dim
         # H_head outputs a single Hamiltonian scalar for the whole system
         self.H_head = MLP(cfg.embed_dim, cfg.embed_dim, 1)
 
     def forward(self, state_ctx, state_tgt, dt, mass):
         B, N, _ = state_ctx.shape
-        
+
         # Prepare canonical coordinates with gradients enabled
         # q = positions, p = momentum (mass * velocity)
-        q = state_ctx[..., :2].clone().requires_grad_(True)
-        v = state_ctx[..., 2:].clone()
+        q = state_ctx[..., :self.n_dim].clone().requires_grad_(True)
+        v = state_ctx[..., self.n_dim:].clone()
         p = (v * mass.unsqueeze(-1)).clone().requires_grad_(True)
         
         # reconstruct the state to feed into the encoder
@@ -65,7 +66,7 @@ class HNNDynamics(nn.Module):
 
         # Compute the scalar Hamiltonian
         z = self.encoder(state_in, mass) # [B, N, D]
-        z_sys = z.sum(dim=1)             # [B, D] 
+        z_sys = z.mean(dim=1)            # [B, D]
         H = self.H_head(z_sys)           # [B, 1]
         
         dH_dq, dH_dp = torch.autograd.grad(
@@ -87,18 +88,21 @@ class HNNDynamics(nn.Module):
 
     def step_forward(self, state, dt, mass):
         """Euler integration step for rollouts."""
-        q = state[..., :2].clone().requires_grad_(True)
-        p = (state[..., 2:] * mass.unsqueeze(-1)).clone().requires_grad_(True)
-        v_recon = p / mass.unsqueeze(-1)
-        state_in = torch.cat([q, v_recon], dim=-1)
-        
+        # build the graph inside enable_grad: eval calls this under no_grad,
+        # so the q/p reconstruction must be recorded for autograd.grad to work
         with torch.enable_grad():
+            q = state[..., :self.n_dim].clone().requires_grad_(True)
+            p = (state[..., self.n_dim:] * mass.unsqueeze(-1)).clone().requires_grad_(True)
+            v_recon = p / mass.unsqueeze(-1)
+            state_in = torch.cat([q, v_recon], dim=-1)
+
             z = self.encoder(state_in, mass)
-            H = self.H_head(z.sum(dim=1))
+            H = self.H_head(z.mean(dim=1))
             dH_dq, dH_dp = torch.autograd.grad(H.sum(), [q, p])
-            
-        dq_dt = dH_dp
-        dv_dt = -dH_dq / mass.unsqueeze(-1)
-        dstate_dt = torch.cat([dq_dt, dv_dt], dim=-1)
-        
-        return state + dstate_dt * dt.view(-1, 1, 1)
+
+        # symplectic (semi-implicit) Euler: advance velocity, then position with the new velocity.
+        dt_ = dt.view(-1, 1, 1)
+        v_new = state[..., self.n_dim:] + (-dH_dq / mass.unsqueeze(-1)) * dt_
+        x_new = state[..., :self.n_dim] + v_new * dt_
+
+        return torch.cat([x_new, v_new], dim=-1).detach()

@@ -28,15 +28,17 @@ def generate(cfg: DataCfg, filepath="nbody_data.npz"):
         sim = rebound.Simulation()
         sim.integrator = "ias15"
 
-        # Planar n-body problem with random positions and velocities
+        # n-body problem with random positions and velocities (2D planar or full 3D)
         for _ in range(cfg.N):
+            z = np.random.uniform(-1, 1) if cfg.n_dim == 3 else 0.0
+            vz = np.random.uniform(-1, 1) if cfg.n_dim == 3 else 0.0
             sim.add(
-                m=1.0, 
-                x=np.random.uniform(-1, 1), 
+                m=1.0,
+                x=np.random.uniform(-1, 1),
                 y=np.random.uniform(-1, 1),
-                vx=np.random.uniform(-1, 1), 
+                vx=np.random.uniform(-1, 1),
                 vy=np.random.uniform(-1, 1),
-                z=0.0, vz=0.0 # Force 2D
+                z=z, vz=vz,
             )
 
         sim.move_to_com() # without this, center-of-mass momentum drifts trivially
@@ -49,11 +51,13 @@ def generate(cfg: DataCfg, filepath="nbody_data.npz"):
         for step in range(num_steps):
             time = step * cfg.dt
             sim.integrate(time)
-            # [N, 4] -> x, y, vx, vy
-            state = [[p.x, p.y, p.vx, p.vy] for p in sim.particles]
+            if cfg.n_dim == 3:
+                state = [[p.x, p.y, p.z, p.vx, p.vy, p.vz] for p in sim.particles]
+            else:
+                state = [[p.x, p.y, p.vx, p.vy] for p in sim.particles]
 
             # if any particle gets too far, reject trajectory
-            positions = np.array(state)[:, :2]
+            positions = np.array(state)[:, :cfg.n_dim]
             if np.max(np.linalg.norm(positions, axis=1)) > 5.0:
                 ejected = True
                 break
@@ -87,12 +91,13 @@ class NBodyDataset(Dataset):
         self.cfg = cfg
         
         self.num_traj, self.num_steps, self.N, self.F = self.states.shape
-        
+        self.n_dim = self.F // 2 # pos + vel
+
         # mass was set to 1.0 in generate()
         self.masses = torch.ones((self.num_traj, self.N), dtype=torch.float32)
 
-        pos = self.states[..., :2]
-        vel = self.states[..., 2:]
+        pos = self.states[..., :self.n_dim]
+        vel = self.states[..., self.n_dim:]
         # learn dataset distribution for normalization
         self.pos_mean, self.pos_std = pos.mean(), pos.std()
         self.vel_mean, self.vel_std = vel.mean(), vel.std()
@@ -101,10 +106,10 @@ class NBodyDataset(Dataset):
         self.vel_std = self.vel_std if self.vel_std > 1e-6 else 1.0
 
     def normalize(self, state: torch.Tensor) -> torch.Tensor:
-        """state shape: [..., 4]"""
+        """state shape: [..., 2*n_dim]"""
         normed = state.clone()
-        normed[..., :2] = (normed[..., :2] - self.pos_mean) / self.pos_std
-        normed[..., 2:] = (normed[..., 2:] - self.vel_mean) / self.vel_std
+        normed[..., :self.n_dim] = (normed[..., :self.n_dim] - self.pos_mean) / self.pos_std
+        normed[..., self.n_dim:] = (normed[..., self.n_dim:] - self.vel_mean) / self.vel_std
         return normed
     
     def __len__(self):

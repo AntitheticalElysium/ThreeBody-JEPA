@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- project: generated artefacts (regenerable, not for publication) ---
+# REBOUND trajectory data (regenerate via data.py)
+*.npz
+# trained checkpoints, decoders, exported npz
+results/
+# Manim: keep the rendered videos, ignore the caches/scratch
+media/texts/
+media/Tex/
+media/images/
+media/**/partial_movie_files/

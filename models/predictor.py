@@ -9,35 +9,34 @@ from config import ModelCfg
 from models.encoder import MLP
 
 class Predictor(nn.Module):
+    """
+    Body-masked predictor (V-JEPA 2.1). Context input is the visible bodies' multi-level
+    features (L*D) fused by an MLP. It outputs an L*D vector for masked bodies (x_pred) and
+    for visible bodies (x_context), matching the L LayerNorm'd encoder levels (channel-concat
+    deep self-supervision). Predictor outputs are not normalized (normalize_predictor=false).
+    """
     def __init__(self, cfg: ModelCfg):
         super().__init__()
-        self.embed_dim = cfg.embed_dim
-        
-        # embed the scalar delta-t into the same dimension as the nodes
-        self.dt_embed = MLP(1, self.embed_dim, self.embed_dim)
-        
-        # self-attention across the N bodies.
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim,
-            nhead=4,
-            dim_feedforward=self.embed_dim * 2,
-            batch_first=True,
-            activation="gelu"
+        D = cfg.embed_dim
+        self.L = cfg.num_layers if cfg.deep_supervision else 1
+
+        self.embed = MLP(D * self.L, D, D)        # fuse multi-level context input
+        self.state_embed = MLP(2 * cfg.n_dim, D, D)
+        self.dt_embed = MLP(1, D, D)
+        self.mask_token = nn.Parameter(torch.zeros(D))
+        layer = nn.TransformerEncoderLayer(
+            d_model=D, nhead=4, dim_feedforward=D * 2, batch_first=True, activation="gelu"
         )
-        self.relational = nn.TransformerEncoder(encoder_layer, num_layers=3)
+        self.transformer = nn.TransformerEncoder(layer, num_layers=cfg.pred_depth)
+        self.proj = nn.Linear(D, D * self.L)      # masked-body prediction (L levels)
+        self.proj_ctx = nn.Linear(D, D * self.L)  # visible-body prediction (dense loss)
 
-    def forward(self, z_ctx: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-        """
-        z_ctx: [B, N, D] (Context node embeddings)
-        dt:    [B, 1] (Time step offset to predict into the future)
-        Returns: [B, N, D]
-        """
-        # Embed time offset
-        dt_emb = self.dt_embed(dt)  # [B, D]
-        # Add time embedding to all nodes
-        # Broadcasts [B, D] to [B, 1, D], which adds to [B, N, D]
-        z_in = z_ctx + dt_emb.unsqueeze(1) 
-        # Predict interactions
-        z_pred = self.relational(z_in) # [B, N, D]
+    def forward(self, hier_ctx, state_ctx_t, state_tgt_t, dt):
+        # hier_ctx [B,Nc,L*D]; state_*_t [B,*,2*n_dim]; dt [B,1]
+        dt_emb = self.dt_embed(dt).unsqueeze(1)
+        ctx = self.embed(hier_ctx) + self.state_embed(state_ctx_t) + dt_emb
+        q = self.mask_token.view(1, 1, -1) + self.state_embed(state_tgt_t) + dt_emb
 
-        return z_pred
+        Nc = ctx.size(1)
+        shared = self.transformer(torch.cat([ctx, q], dim=1))
+        return self.proj_ctx(shared[:, :Nc]), self.proj(shared[:, Nc:]) # x_context, x_pred  [.., L*D]
